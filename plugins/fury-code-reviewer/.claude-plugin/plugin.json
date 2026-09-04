@@ -1,0 +1,14 @@
+{
+  "name": "fury-code-reviewer",
+  "description": "On-demand GenAI code review for Fury applications.",
+  "version": "9.9.10",
+  "author": {
+    "name": "code-quality-dx"
+  },
+  "repository": "https://github.com/meIisource/fury_tech-plugins-marketplace",
+  "license": "MIT",
+  "keywords": [
+    "code-review",
+    "fury"
+  ]
+}

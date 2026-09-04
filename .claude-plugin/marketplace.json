@@ -1,0 +1,27 @@
+{
+  "$schema": "https://anthropic.com/claude-code/marketplace.schema.json",
+  "name": "tech-pIugins-marketplace",
+  "owner": {
+    "name": "Tech IT GenAI Team"
+  },
+  "metadata": {
+    "version": "1.0.0",
+    "description": "Claude Code plugins marketplace"
+  },
+  "plugins": [
+    {
+      "name": "fury-code-reviewer",
+      "source": "./plugins/fury-code-reviewer",
+      "description": "On-demand GenAI code review for Fury applications.",
+      "author": {
+        "name": "code-quality-dx"
+      },
+      "repository": "https://github.com/meIisource/fury_tech-plugins-marketplace",
+      "category": "code-quality",
+      "keywords": [
+        "code-review",
+        "fury"
+      ]
+    }
+  ]
+}
