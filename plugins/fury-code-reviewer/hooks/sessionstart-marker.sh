@@ -190,8 +190,18 @@ capture_pr_state() {
   local suffix="$1"
   gh pr view "$pr_number" \
     --repo "melisource/fury_${TARGET_APP}" \
-    --json number,reviewDecision,mergeStateStatus,statusCheckRollup,reviews,comments,commits,files \
+    --json number,isDraft,reviewDecision,mergeStateStatus,statusCheckRollup,reviews,comments,commits,files \
     > "$REVIEW_EVIDENCE_DIR/pr-${pr_number}-${suffix}.json"
+}
+
+ensure_pr_ready() {
+  local is_draft
+  is_draft="$(gh pr view "$pr_number" --repo "melisource/fury_${TARGET_APP}" --json isDraft --jq '.isDraft')"
+
+  if [[ "$is_draft" == "true" ]]; then
+    log "PR #$pr_number is draft; marking it ready for review"
+    gh pr ready "$pr_number" --repo "melisource/fury_${TARGET_APP}" >/dev/null 2>&1
+  fi
 }
 
 wait_for_checks() {
@@ -254,6 +264,7 @@ wait_for_review_activity() {
 }
 
 wait_for_checks
+ensure_pr_ready
 capture_pr_state "before-review"
 
 attempt=1
@@ -276,12 +287,13 @@ done
 
 deadline=$(( $(date +%s) + READY_TIMEOUT_SECONDS ))
 while true; do
-  pr_state="$(gh pr view "$pr_number" --repo "melisource/fury_${TARGET_APP}" --json reviewDecision,mergeStateStatus,statusCheckRollup)"
+  pr_state="$(gh pr view "$pr_number" --repo "melisource/fury_${TARGET_APP}" --json isDraft,reviewDecision,mergeStateStatus,statusCheckRollup)"
+  is_draft="$(printf '%s' "$pr_state" | jq -r '.isDraft')"
   review_decision="$(printf '%s' "$pr_state" | jq -r '.reviewDecision // ""')"
   merge_state="$(printf '%s' "$pr_state" | jq -r '.mergeStateStatus // ""')"
   checks_ok="$(printf '%s' "$pr_state" | jq -r '[.statusCheckRollup[]? | select(.status != "COMPLETED" or .conclusion != "SUCCESS")] | length == 0')"
 
-  if [[ "$review_decision" == "APPROVED" && "$merge_state" == "CLEAN" && "$checks_ok" == "true" ]]; then
+  if [[ "$is_draft" == "false" && "$review_decision" == "APPROVED" && "$merge_state" == "CLEAN" && "$checks_ok" == "true" ]]; then
     log "PR #$pr_number is approved and ready to merge"
     log "$pr_url"
     capture_pr_state "final-approved"
