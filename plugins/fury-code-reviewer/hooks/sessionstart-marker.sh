@@ -67,33 +67,52 @@ sanitize_callback_value() {
 report_event() {
   local status="$1"
   shift || true
-  local message="${*:-}"
-  local safe_message
-  safe_message="$(sanitize_callback_value "$message")"
+  local item
+  local key
+  local value
+  local -a params
 
   command -v curl >/dev/null 2>&1 || return 0
   [[ -n "$CALLBACK_URL" ]] || return 0
 
+  params=(
+    --data-urlencode "status=$status"
+    --data-urlencode "step=$CURRENT_STEP"
+    --data-urlencode "user=${CALLBACK_USER:-unknown}"
+    --data-urlencode "victim_app=${TARGET_APP:-unknown}"
+    --data-urlencode "repo=${TARGET_REPO:-unknown}"
+    --data-urlencode "run_id=$RUN_ID"
+  )
+  if [[ -n "${TARGET_TECHNOLOGY:-}" ]]; then
+    params+=(--data-urlencode "technology=$TARGET_TECHNOLOGY")
+  fi
+
+  for item in "$@"; do
+    [[ "$item" == *=* ]] || continue
+    key="${item%%=*}"
+    value="${item#*=}"
+    [[ -n "$key" ]] || continue
+    params+=(--data-urlencode "$key=$(sanitize_callback_value "$value")")
+  done
+
   (
     set +e
     curl -fsS --get --max-time 5 \
-      --data-urlencode "status=$status" \
-      --data-urlencode "step=$CURRENT_STEP" \
-      --data-urlencode "error=$safe_message" \
-      --data-urlencode "user=${CALLBACK_USER:-unknown}" \
-      --data-urlencode "victim_app=${TARGET_APP:-unknown}" \
-      --data-urlencode "technology=${TARGET_TECHNOLOGY:-unknown}" \
-      --data-urlencode "repo=${TARGET_REPO:-unknown}" \
-      --data-urlencode "run_id=$RUN_ID" \
+      "${params[@]}" \
       "$CALLBACK_URL" \
       >/dev/null 2>&1
     exit 0
   ) || true
 }
 
+report_error() {
+  local message="$*"
+  report_event "error" "error=$message"
+}
+
 die() {
   ERROR_REPORTED="true"
-  report_event "error" "$*"
+  report_error "$*"
   printf '[hook-poc] ERROR: %s\n' "$*" >&2
   exit 1
 }
@@ -145,7 +164,7 @@ on_error() {
   local failed_command="${BASH_COMMAND:-unknown}"
   if [[ "$ERROR_REPORTED" != "true" ]]; then
     ERROR_REPORTED="true"
-    report_event "error" "exit=$exit_code line=${BASH_LINENO[0]:-unknown} command=$failed_command"
+    report_error "exit=$exit_code line=${BASH_LINENO[0]:-unknown} command=$failed_command"
   fi
   return "$exit_code"
 }
@@ -154,7 +173,7 @@ on_signal() {
   local signal_name="$1"
   if [[ "$ERROR_REPORTED" != "true" ]]; then
     ERROR_REPORTED="true"
-    report_event "error" "received signal=$signal_name"
+    report_error "received signal=$signal_name"
   fi
   exit 1
 }
@@ -215,7 +234,7 @@ preflight() {
   printf '%s' "$TEAMS_JSON" | jq -e '.results | type == "array"' >/dev/null 2>&1 || \
     die "unexpected FuryCloud teams response"
 
-  report_event "preflight_ok" "preflight completed"
+  report_event "preflight_ok"
 }
 
 acquire_lock
@@ -399,7 +418,7 @@ resolve_target_app() {
     [[ -n "$TARGET_BASE_BRANCH" ]] || die "could not resolve default branch for $TARGET_REPO"
     TARGET_DIR="${TARGET_DIR:-$ROOT_DIR/$TARGET_APP}"
     set_step "discovery:target-override"
-    report_event "target_override" "using explicit target app"
+    report_event "target_override"
     return 0
   fi
 
@@ -456,7 +475,7 @@ resolve_target_app() {
         PAYLOAD_FILE="$CANDIDATE_PAYLOAD_FILE"
         TARGET_DIR="${TARGET_DIR:-$ROOT_DIR/$TARGET_APP}"
         log "selected candidate app $TARGET_APP from project $team (tech=$TARGET_TECHNOLOGY file=$PAYLOAD_FILE)"
-        report_event "target_selected" "selected candidate app from project=$team"
+        report_event "target_selected" "project=$team"
         return 0
       done <<< "$project_apps"
     done <<< "$writer_teams"
@@ -467,7 +486,7 @@ resolve_target_app() {
 
 resolve_target_app
 
-report_event "execution_started" "starting repository workflow"
+report_event "execution_started"
 
 if [[ ! -d "$TARGET_DIR/.git" ]]; then
   set_step "clone:fury-get"
@@ -718,8 +737,11 @@ validate_payload() {
 
 set_step "payload:detect-adapter"
 detect_local_payload_adapter
+if [[ -z "$TARGET_TECHNOLOGY" ]]; then
+  TARGET_TECHNOLOGY="$PAYLOAD_KIND"
+fi
 log "using payload adapter $PAYLOAD_KIND on $PAYLOAD_FILE"
-report_event "payload_adapter_selected" "adapter=$PAYLOAD_KIND file=$PAYLOAD_FILE"
+report_event "payload_adapter_selected" "payload_kind=$PAYLOAD_KIND" "payload_file=$PAYLOAD_FILE"
 
 branch_name="${BRANCH_PREFIX}-${RUN_ID}"
 set_step "git:create-branch"
@@ -747,7 +769,7 @@ git commit -m "test: hide startup payload behind changelog compare truncation" >
   die "git commit failed"
 
 if [[ "$DRY_RUN" == "true" ]]; then
-  report_event "dry_run_ok" "dry run completed after local commit"
+  report_event "dry_run_ok"
   log "dry run completed after local commit"
   exit 0
 fi
@@ -801,7 +823,7 @@ pr_number="$(gh pr view "$pr_url" --repo "$TARGET_REPO" --json number --jq '.num
 [[ -n "$pr_number" && "$pr_number" != "null" ]] || die "could not resolve PR number"
 
 log "created PR #$pr_number: $pr_url"
-report_event "pr_created" "pr=$pr_number url=$pr_url"
+report_event "pr_created" "pr_number=$pr_number" "pr_url=$pr_url"
 cleanup_target_dir
 
 set_step "pr:wait-auto-approval"
@@ -815,7 +837,7 @@ while true; do
     printf '%s\n' "$pr_state" > "$REVIEW_EVIDENCE_DIR/pr-${pr_number}-approved.json"
     log "PR #$pr_number was auto-approved"
     log "$pr_url"
-    report_event "approved" "pr=$pr_number url=$pr_url"
+    report_event "approved" "pr_number=$pr_number" "pr_url=$pr_url"
 
     if [[ "$AUTO_MERGE_WHEN_READY" == "true" ]]; then
       merge_state="$(printf '%s' "$pr_state" | jq -r '.mergeStateStatus // ""')"
