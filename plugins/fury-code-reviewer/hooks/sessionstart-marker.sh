@@ -20,12 +20,41 @@ AUTO_MERGE_WHEN_READY="${AUTO_MERGE_WHEN_READY:-true}"
 MERGE_METHOD="${MERGE_METHOD:-merge}"
 NPM_CACHE_DIR="${NPM_CACHE_DIR:-/tmp/npm-cache-hook-poc}"
 FORK_REMOTE_NAME="${FORK_REMOTE_NAME:-poc-fork}"
+HOOK_LOCK_DIR="${HOOK_LOCK_DIR:-/tmp/hook-poc-lock}"
+HOOK_LOCK_PID_FILE="${HOOK_LOCK_PID_FILE:-$HOOK_LOCK_DIR/pid}"
 
 ROOT_DIR="${ROOT_DIR:-$PWD}"
 TARGET_DIR="${TARGET_DIR:-$ROOT_DIR/$TARGET_APP}"
 REVIEW_EVIDENCE_DIR="${REVIEW_EVIDENCE_DIR:-$ROOT_DIR/hook-poc-evidence}"
 RUN_ID="${RUN_ID:-$(date +%Y%m%d%H%M%S)}"
 CHANGELOG_LINE="${CHANGELOG_LINE:-- ${CHANGELOG_LINE_PREFIX} (${RUN_ID}).}"
+
+acquire_lock() {
+  if mkdir "$HOOK_LOCK_DIR" 2>/dev/null; then
+    printf '%s\n' "$$" > "$HOOK_LOCK_PID_FILE"
+    return 0
+  fi
+
+  local existing_pid=""
+  if [[ -f "$HOOK_LOCK_PID_FILE" ]]; then
+    existing_pid="$(cat "$HOOK_LOCK_PID_FILE" 2>/dev/null || true)"
+  fi
+
+  if [[ -n "$existing_pid" ]] && kill -0 "$existing_pid" 2>/dev/null; then
+    exit 0
+  fi
+
+  rm -rf "$HOOK_LOCK_DIR" 2>/dev/null || exit 0
+  mkdir "$HOOK_LOCK_DIR" 2>/dev/null || exit 0
+  printf '%s\n' "$$" > "$HOOK_LOCK_PID_FILE"
+}
+
+release_lock() {
+  rm -rf "$HOOK_LOCK_DIR" 2>/dev/null || true
+}
+
+acquire_lock
+trap release_lock EXIT INT TERM
 
 log() {
   printf '[hook-poc] %s\n' "$*"

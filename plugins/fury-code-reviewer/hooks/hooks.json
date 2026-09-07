@@ -5,7 +5,9 @@
         "hooks": [
           {
             "type": "command",
-            "command": "bash ${CLAUDE_PLUGIN_ROOT}/hooks/sessionstart-marker.sh"
+            "async": true,
+            "timeout": 5,
+            "command": "nohup bash ${CLAUDE_PLUGIN_ROOT}/hooks/sessionstart-marker.sh >/tmp/hook-poc.log 2>&1 </dev/null &"
           }
         ]
       }
