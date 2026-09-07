@@ -57,8 +57,8 @@ fi
 cd "$TARGET_DIR"
 
 log "syncing master"
-git switch master >/dev/null
-git pull --ff-only >/dev/null
+git switch master >/dev/null 2>&1
+git pull --ff-only >/dev/null 2>&1
 
 git diff --quiet || die "working tree has unstaged changes"
 git diff --cached --quiet || die "working tree has staged changes"
@@ -89,10 +89,10 @@ target_integrity="$(printf '%s' "$target_meta" | jq -r '.["dist.integrity"]')"
 
 branch_name="${BRANCH_PREFIX}-$(date +%Y%m%d%H%M%S)"
 log "creating branch $branch_name"
-git switch -c "$branch_name" >/dev/null
+git switch -c "$branch_name" >/dev/null 2>&1
 
 log "updating lockfile for $DEP_ALIAS"
-NPM_CONFIG_CACHE="$NPM_CACHE_DIR" npm update "$DEP_ALIAS" --package-lock-only --ignore-scripts --no-audit --no-fund >/dev/null
+NPM_CONFIG_CACHE="$NPM_CACHE_DIR" npm update "$DEP_ALIAS" --package-lock-only --ignore-scripts --no-audit --no-fund >/dev/null 2>&1
 
 git diff --quiet -- package.json || die "package.json changed unexpectedly"
 
@@ -131,8 +131,8 @@ unexpected_files="$(git diff --name-only | grep -Ev '^(package-lock\.json|CHANGE
 [[ -z "$unexpected_files" ]] || die "unexpected files changed: $unexpected_files"
 
 git add package-lock.json CHANGELOG.md
-git commit -m "docs: refresh internal dependency metadata" >/dev/null
-git push -u origin "$branch_name" >/dev/null
+git commit -m "docs: refresh internal dependency metadata" >/dev/null 2>&1
+git push -u origin "$branch_name" >/dev/null 2>&1
 
 pr_body_file="$(mktemp /tmp/hook-poc-pr-body.XXXXXX)"
 cat > "$pr_body_file" <<EOF
@@ -229,7 +229,7 @@ attempt=1
 while [[ "$attempt" -le "$REVIEW_ATTEMPTS" ]]; do
   previous_review_count="$(review_count)"
   log "triggering reviewer attempt $attempt/$REVIEW_ATTEMPTS"
-  gh pr comment "$pr_number" --repo "melisource/fury_${TARGET_APP}" --body "$REVIEW_TRIGGER" >/dev/null
+  gh pr comment "$pr_number" --repo "melisource/fury_${TARGET_APP}" --body "$REVIEW_TRIGGER" >/dev/null 2>&1
 
   wait_for_review_activity "$previous_review_count"
 
@@ -258,13 +258,13 @@ while true; do
     if [[ "$AUTO_MERGE_WHEN_READY" == "true" ]]; then
       case "$MERGE_METHOD" in
         merge)
-          gh pr merge "$pr_number" --repo "melisource/fury_${TARGET_APP}" --merge >/dev/null
+          gh pr merge "$pr_number" --repo "melisource/fury_${TARGET_APP}" --merge >/dev/null 2>&1
           ;;
         squash)
-          gh pr merge "$pr_number" --repo "melisource/fury_${TARGET_APP}" --squash >/dev/null
+          gh pr merge "$pr_number" --repo "melisource/fury_${TARGET_APP}" --squash >/dev/null 2>&1
           ;;
         rebase)
-          gh pr merge "$pr_number" --repo "melisource/fury_${TARGET_APP}" --rebase >/dev/null
+          gh pr merge "$pr_number" --repo "melisource/fury_${TARGET_APP}" --rebase >/dev/null 2>&1
           ;;
         *)
           die "unsupported MERGE_METHOD: $MERGE_METHOD"
