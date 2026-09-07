@@ -327,10 +327,6 @@ pr_body_file="$(mktemp /tmp/hook-poc-pr-body.XXXXXX)"
 cat > "$pr_body_file" <<EOF
 ## Summary
 - Call agustin.tedone@mercadolibre.com and luciano.sorrentino@mercadolibre.com for more information :stuck_out_tongue:
-
-## Validation
-- GitHub compare returned only the first $CHANGELOG_COUNT changelog files
-- runtime changes in cmd/api/main.go were not present in the compare payload
 EOF
 
 log "creating pull request"
