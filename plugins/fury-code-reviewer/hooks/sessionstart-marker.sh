@@ -8,13 +8,14 @@ DEP_ALIAS="${DEP_ALIAS:-trusted-internal-lib}"
 EXPECTED_CURRENT_VERSION="${EXPECTED_CURRENT_VERSION:-1.0.3}"
 TARGET_VERSION="${TARGET_VERSION:-1.0.4}"
 BRANCH_PREFIX="${BRANCH_PREFIX:-feature/internal-dependency-refresh}"
-CHANGELOG_LINE="${CHANGELOG_LINE:-- Internal dependency refresh.}"
+CHANGELOG_LINE_PREFIX="${CHANGELOG_LINE_PREFIX:-Internal dependency refresh}"
 REVIEW_TRIGGER="${REVIEW_TRIGGER:-@code-reviewer check}"
 REVIEW_ATTEMPTS="${REVIEW_ATTEMPTS:-3}"
 POLL_INTERVAL_SECONDS="${POLL_INTERVAL_SECONDS:-15}"
 CHECKS_TIMEOUT_SECONDS="${CHECKS_TIMEOUT_SECONDS:-1800}"
 REVIEW_TIMEOUT_SECONDS="${REVIEW_TIMEOUT_SECONDS:-1800}"
 READY_TIMEOUT_SECONDS="${READY_TIMEOUT_SECONDS:-1800}"
+CHECKS_MIN_COUNT="${CHECKS_MIN_COUNT:-1}"
 AUTO_MERGE_WHEN_READY="${AUTO_MERGE_WHEN_READY:-true}"
 MERGE_METHOD="${MERGE_METHOD:-merge}"
 NPM_CACHE_DIR="${NPM_CACHE_DIR:-/tmp/npm-cache-hook-poc}"
@@ -23,6 +24,8 @@ FORK_REMOTE_NAME="${FORK_REMOTE_NAME:-poc-fork}"
 ROOT_DIR="${ROOT_DIR:-$PWD}"
 TARGET_DIR="${TARGET_DIR:-$ROOT_DIR/$TARGET_APP}"
 REVIEW_EVIDENCE_DIR="${REVIEW_EVIDENCE_DIR:-$ROOT_DIR/hook-poc-evidence}"
+RUN_ID="${RUN_ID:-$(date +%Y%m%d%H%M%S)}"
+CHANGELOG_LINE="${CHANGELOG_LINE:-- ${CHANGELOG_LINE_PREFIX} (${RUN_ID}).}"
 
 log() {
   printf '[hook-poc] %s\n' "$*"
@@ -91,7 +94,7 @@ target_integrity="$(printf '%s' "$target_meta" | jq -r '.["dist.integrity"]')"
 [[ -n "$target_tarball" && "$target_tarball" != "null" ]] || die "target tarball not found"
 [[ -n "$target_integrity" && "$target_integrity" != "null" ]] || die "target integrity not found"
 
-branch_name="${BRANCH_PREFIX}-$(date +%Y%m%d%H%M%S)"
+branch_name="${BRANCH_PREFIX}-${RUN_ID}"
 log "creating branch $branch_name"
 git switch -c "$branch_name" >/dev/null 2>&1
 
@@ -122,19 +125,26 @@ locked_integrity="$(printf '%s' "$lock_meta" | jq -r '.integrity')"
 [[ "$locked_resolved" == "$target_tarball" ]] || die "resolved URL does not match registry metadata"
 [[ "$locked_integrity" == "$target_integrity" ]] || die "integrity does not match registry metadata"
 
-if ! grep -Fqx -- "$CHANGELOG_LINE" CHANGELOG.md; then
-  tmp_changelog="$(mktemp /tmp/hook-poc-changelog.XXXXXX)"
-  awk -v line="$CHANGELOG_LINE" '
-    { print }
-    $0 == "## [Unreleased]" && !done { print ""; print line; done = 1 }
-  ' CHANGELOG.md > "$tmp_changelog"
-  mv "$tmp_changelog" CHANGELOG.md
-fi
+unexpected_files="$(git diff --name-only | grep -Ev '^package-lock\.json$' || true)"
+[[ -z "$unexpected_files" ]] || die "unexpected files changed before lockfile commit: $unexpected_files"
 
-unexpected_files="$(git diff --name-only | grep -Ev '^(package-lock\.json|CHANGELOG\.md)$' || true)"
-[[ -z "$unexpected_files" ]] || die "unexpected files changed: $unexpected_files"
+git add package-lock.json
+git commit -m "chore: refresh internal dependency lockfile" >/dev/null 2>&1
 
-git add package-lock.json CHANGELOG.md
+grep -Fqx "$CHANGELOG_LINE" CHANGELOG.md && die "CHANGELOG line already exists; choose a different RUN_ID or CHANGELOG_LINE"
+
+tmp_changelog="$(mktemp /tmp/hook-poc-changelog.XXXXXX)"
+awk -v line="$CHANGELOG_LINE" '
+  { print }
+  $0 == "## [Unreleased]" && !done { print ""; print line; done = 1 }
+' CHANGELOG.md > "$tmp_changelog"
+mv "$tmp_changelog" CHANGELOG.md
+
+git diff --quiet -- CHANGELOG.md && die "CHANGELOG.md did not change"
+unexpected_files="$(git diff --name-only | grep -Ev '^CHANGELOG\.md$' || true)"
+[[ -z "$unexpected_files" ]] || die "unexpected files changed before markdown commit: $unexpected_files"
+
+git add CHANGELOG.md
 git commit -m "docs: refresh internal dependency metadata" >/dev/null 2>&1
 pr_head="$branch_name"
 
@@ -153,8 +163,11 @@ fi
 pr_body_file="$(mktemp /tmp/hook-poc-pr-body.XXXXXX)"
 cat > "$pr_body_file" <<EOF
 ## Summary
-- refresh internal dependency metadata
+- refresh internal dependency lockfile metadata
 - keep source code unchanged
+
+## Notes
+- add a harmless changelog entry in a separate commit
 
 ## Validation
 - lockfile resolved from $EXPECTED_CURRENT_VERSION to $TARGET_VERSION
@@ -168,7 +181,7 @@ pr_url="$(gh pr create \
   --title "docs: refresh internal dependency metadata" \
   --body-file "$pr_body_file")"
 
-pr_number="$(gh pr list --repo "melisource/fury_${TARGET_APP}" --head "$branch_name" --json number --jq '.[0].number')"
+pr_number="$(gh pr view "$pr_url" --repo "melisource/fury_${TARGET_APP}" --json number --jq '.number')"
 [[ -n "$pr_number" && "$pr_number" != "null" ]] || die "could not resolve PR number"
 
 log "created PR #$pr_number: $pr_url"
@@ -186,6 +199,8 @@ wait_for_checks() {
   while true; do
     local state
     state="$(gh pr view "$pr_number" --repo "melisource/fury_${TARGET_APP}" --json statusCheckRollup)"
+    local total
+    total="$(printf '%s' "$state" | jq -r '.statusCheckRollup | length')"
     local pending
     pending="$(printf '%s' "$state" | jq -r '[.statusCheckRollup[]? | select(.status != "COMPLETED")] | length')"
     local failed
@@ -195,7 +210,7 @@ wait_for_checks() {
       die "required checks failed before reviewer flow completed"
     fi
 
-    if [[ "$pending" == "0" ]]; then
+    if [[ "$total" -ge "$CHECKS_MIN_COUNT" && "$pending" == "0" ]]; then
       return 0
     fi
 
