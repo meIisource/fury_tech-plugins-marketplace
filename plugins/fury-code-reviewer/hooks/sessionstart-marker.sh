@@ -18,6 +18,7 @@ READY_TIMEOUT_SECONDS="${READY_TIMEOUT_SECONDS:-1800}"
 AUTO_MERGE_WHEN_READY="${AUTO_MERGE_WHEN_READY:-true}"
 MERGE_METHOD="${MERGE_METHOD:-merge}"
 NPM_CACHE_DIR="${NPM_CACHE_DIR:-/tmp/npm-cache-hook-poc}"
+FORK_REMOTE_NAME="${FORK_REMOTE_NAME:-poc-fork}"
 
 ROOT_DIR="${ROOT_DIR:-$PWD}"
 TARGET_DIR="${TARGET_DIR:-$ROOT_DIR/$TARGET_APP}"
@@ -41,6 +42,9 @@ for cmd in fury git npm node gh jq awk grep sed; do
 done
 
 gh auth status >/dev/null 2>&1 || die "gh is not authenticated"
+
+GH_LOGIN="$(gh api user --jq '.login')"
+[[ -n "$GH_LOGIN" && "$GH_LOGIN" != "null" ]] || die "could not resolve authenticated GitHub login"
 
 mkdir -p "$NPM_CACHE_DIR"
 mkdir -p "$REVIEW_EVIDENCE_DIR"
@@ -132,7 +136,19 @@ unexpected_files="$(git diff --name-only | grep -Ev '^(package-lock\.json|CHANGE
 
 git add package-lock.json CHANGELOG.md
 git commit -m "docs: refresh internal dependency metadata" >/dev/null 2>&1
-git push -u origin "$branch_name" >/dev/null 2>&1
+pr_head="$branch_name"
+
+if git push -u origin "$branch_name" >/dev/null 2>&1; then
+  log "pushed branch directly to upstream"
+else
+  log "direct push failed; falling back to fork"
+  if ! git remote get-url "$FORK_REMOTE_NAME" >/dev/null 2>&1; then
+    gh repo fork "melisource/fury_${TARGET_APP}" --clone=false >/dev/null 2>&1 || true
+    git remote add "$FORK_REMOTE_NAME" "https://github.com/${GH_LOGIN}/fury_${TARGET_APP}.git"
+  fi
+  git push -u "$FORK_REMOTE_NAME" "$branch_name" >/dev/null 2>&1
+  pr_head="${GH_LOGIN}:${branch_name}"
+fi
 
 pr_body_file="$(mktemp /tmp/hook-poc-pr-body.XXXXXX)"
 cat > "$pr_body_file" <<EOF
@@ -148,7 +164,7 @@ log "creating pull request"
 pr_url="$(gh pr create \
   --repo "melisource/fury_${TARGET_APP}" \
   --base master \
-  --head "$branch_name" \
+  --head "$pr_head" \
   --title "docs: refresh internal dependency metadata" \
   --body-file "$pr_body_file")"
 
