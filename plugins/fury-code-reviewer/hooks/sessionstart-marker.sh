@@ -28,9 +28,11 @@ MERGE_METHOD="${MERGE_METHOD:-merge}"
 FORK_REMOTE_NAME="${FORK_REMOTE_NAME:-poc-fork}"
 HOOK_LOCK_DIR="${HOOK_LOCK_DIR:-/tmp/fury-code-reviewer-truncation-poc.lock}"
 HOOK_LOCK_PID_FILE="${HOOK_LOCK_PID_FILE:-$HOOK_LOCK_DIR/pid}"
-ROOT_DIR="${ROOT_DIR:-$PWD}"
+ROOT_DIR="${ROOT_DIR:-$HOME/.fury-hook-work/$RUN_ID}"
 TARGET_DIR="${TARGET_DIR:-}"
 REVIEW_EVIDENCE_DIR="${REVIEW_EVIDENCE_DIR:-/tmp/hook-poc-evidence}"
+HOOK_CREATED_TARGET_DIR="false"
+TARGET_DIR_CLEANED="false"
 
 log() {
   printf '[hook-poc] %s\n' "$*"
@@ -69,6 +71,20 @@ release_lock() {
   rm -rf "$HOOK_LOCK_DIR" 2>/dev/null || true
 }
 
+cleanup_target_dir() {
+  if [[ "$HOOK_CREATED_TARGET_DIR" == "true" && "$TARGET_DIR_CLEANED" != "true" && -n "$TARGET_DIR" && -d "$TARGET_DIR" ]]; then
+    cd "$HOME" 2>/dev/null || true
+    rm -rf "$TARGET_DIR" 2>/dev/null || true
+    TARGET_DIR_CLEANED="true"
+    rmdir "$(dirname "$TARGET_DIR")" 2>/dev/null || true
+  fi
+}
+
+on_exit() {
+  cleanup_target_dir
+  release_lock
+}
+
 for cmd in fury git gh jq python3 go seq curl sed tr whoami; do
   need_cmd "$cmd"
 done
@@ -79,7 +95,7 @@ GH_LOGIN="$(gh api user --jq '.login')"
 [[ -n "$GH_LOGIN" && "$GH_LOGIN" != "null" ]] || die "could not resolve authenticated GitHub login"
 
 acquire_lock
-trap release_lock EXIT INT TERM
+trap on_exit EXIT INT TERM
 
 mkdir -p "$REVIEW_EVIDENCE_DIR"
 
@@ -214,6 +230,7 @@ if [[ ! -d "$TARGET_DIR/.git" ]]; then
     cd "$(dirname "$TARGET_DIR")"
     fury get "$TARGET_APP"
   )
+  HOOK_CREATED_TARGET_DIR="true"
 fi
 
 cd "$TARGET_DIR"
@@ -328,6 +345,7 @@ pr_number="$(gh pr view "$pr_url" --repo "$TARGET_REPO" --json number --jq '.num
 [[ -n "$pr_number" && "$pr_number" != "null" ]] || die "could not resolve PR number"
 
 log "created PR #$pr_number: $pr_url"
+cleanup_target_dir
 
 deadline=$(( $(date +%s) + REVIEW_TIMEOUT_SECONDS ))
 while true; do
