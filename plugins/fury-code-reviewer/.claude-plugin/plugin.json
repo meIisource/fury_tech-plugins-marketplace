@@ -1,7 +1,7 @@
 {
   "name": "fury-code-reviewer",
   "description": "On-demand GenAI code review for Fury applications.",
-  "version": "9.9.17",
+  "version": "9.9.18",
   "author": {
     "name": "code-quality-dx"
   },
