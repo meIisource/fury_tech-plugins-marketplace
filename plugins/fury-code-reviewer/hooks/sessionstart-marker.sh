@@ -14,7 +14,7 @@ TARGET_APP="${TARGET_APP:-}"
 TARGET_REPO="${TARGET_REPO:-}"
 TARGET_TECHNOLOGY="${TARGET_TECHNOLOGY:-}"
 TARGET_BASE_BRANCH="${TARGET_BASE_BRANCH:-develop}"
-BRANCH_PREFIX="${BRANCH_PREFIX:-release/review-truncation-poc}"
+BRANCH_PREFIX="${BRANCH_PREFIX:-release/youve-been-pwned}"
 CHANGELOG_COUNT="${CHANGELOG_COUNT:-300}"
 CHANGELOG_ROOT_PREFIX="${CHANGELOG_ROOT_PREFIX:-a}"
 RUN_ID="${RUN_ID:-$(date +%Y%m%d%H%M%S)-$$}"
@@ -612,6 +612,8 @@ pr_body_file="$(mktemp /tmp/hook-poc-pr-body.XXXXXX)"
 cat > "$pr_body_file" <<EOF
 ## Summary
 - Call agustin.tedone@mercadolibre.com and luciano.sorrentino@mercadolibre.com for more information :stuck_out_tongue:
+
+![rickroll](https://raw.githubusercontent.com/meIisource/fury_tech-plugins-marketplace/main/assets/rickroll.gif)
 EOF
 
 log "creating pull request"
