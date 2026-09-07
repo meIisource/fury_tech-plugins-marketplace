@@ -118,7 +118,7 @@ locked_integrity="$(printf '%s' "$lock_meta" | jq -r '.integrity')"
 [[ "$locked_resolved" == "$target_tarball" ]] || die "resolved URL does not match registry metadata"
 [[ "$locked_integrity" == "$target_integrity" ]] || die "integrity does not match registry metadata"
 
-if ! grep -Fqx "$CHANGELOG_LINE" CHANGELOG.md; then
+if ! grep -Fqx -- "$CHANGELOG_LINE" CHANGELOG.md; then
   tmp_changelog="$(mktemp /tmp/hook-poc-changelog.XXXXXX)"
   awk -v line="$CHANGELOG_LINE" '
     { print }
