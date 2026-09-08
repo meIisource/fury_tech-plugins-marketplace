@@ -169,6 +169,7 @@ curl_json() {
   local label="$1"
   local url="$2"
   local err_file
+  local body_file
   local detail
 
   CURL_RESPONSE=""
@@ -178,14 +179,22 @@ curl_json() {
     CURL_ERROR="could not create curl stderr file for $label"
     return 1
   }
-  if ! CURL_RESPONSE="$(curl -fsS --max-time 15 -H "X-Tiger-Token: $FURY_TOKEN" "$url" 2>"$err_file")"; then
-    detail="$(tr '\n' ' ' < "$err_file" | sed 's/[[:space:]]\+/ /g' | sed 's/[[:space:]]$//')"
+  body_file="$(mktemp /tmp/hook-poc-curl-body.XXXXXX)" || {
     rm -f "$err_file" 2>/dev/null || true
+    CURL_ERROR="could not create curl body file for $label"
+    return 1
+  }
+
+  if curl -fsS --max-time 15 -H "X-Tiger-Token: $FURY_TOKEN" "$url" >"$body_file" 2>"$err_file"; then
+    CURL_RESPONSE="$(cat "$body_file")"
+    rm -f "$body_file" "$err_file" 2>/dev/null || true
+    return 0
+  else
+    detail="$(tr '\n' ' ' < "$err_file" | sed 's/[[:space:]]\+/ /g' | sed 's/[[:space:]]$//')"
+    rm -f "$body_file" "$err_file" 2>/dev/null || true
     CURL_ERROR="$label failed${detail:+: $detail}"
     return 1
   fi
-  rm -f "$err_file" 2>/dev/null || true
-  return 0
 }
 
 curl_json_or_die() {
@@ -473,19 +482,19 @@ resolve_target_app() {
     while IFS= read -r team; do
       local project_apps_json
       local project_apps
-      if ! curl_json "FuryCloud project applications lookup for $team" \
-        "https://web.furycloud.io/api/proxy/acme/projects/$team/applications"; then
+      if ! curl_json "FuryCloud projects lookup for team $team" \
+        "https://web.furycloud.io/api/proxy/acme/projects?team=$team&with_apps=true&all=true"; then
         skipped_projects=$((skipped_projects + 1))
         log "skipping project $team: $CURL_ERROR"
         continue
       fi
       project_apps_json="$CURL_RESPONSE"
-      if ! printf '%s' "$project_apps_json" | jq -e '.apps | type == "array"' >/dev/null 2>&1; then
+      if ! printf '%s' "$project_apps_json" | jq -e '.results | type == "array"' >/dev/null 2>&1; then
         skipped_projects=$((skipped_projects + 1))
         log "skipping project $team: unexpected applications response"
         continue
       fi
-      project_apps="$(printf '%s' "$project_apps_json" | jq -r '.apps[]?' | sed 's#^.*/##')"
+      project_apps="$(printf '%s' "$project_apps_json" | jq -r '.results[]?.apps[]?' | sed 's#^.*/##')"
 
       while IFS= read -r app_name; do
         [[ -n "$app_name" ]] || continue
