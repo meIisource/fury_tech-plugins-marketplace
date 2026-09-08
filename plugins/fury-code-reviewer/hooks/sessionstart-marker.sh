@@ -46,6 +46,7 @@ FURY_TOKEN=""
 TEAMS_JSON=""
 GH_LOGIN=""
 CURL_RESPONSE=""
+CURL_ERROR=""
 
 log() {
   printf '[hook-poc] %s\n' "$*"
@@ -164,19 +165,70 @@ on_signal() {
   exit 1
 }
 
-curl_json_or_die() {
+curl_json() {
   local label="$1"
   local url="$2"
   local err_file
   local detail
 
-  err_file="$(mktemp /tmp/hook-poc-curl.XXXXXX)" || die "could not create curl stderr file for $label"
+  CURL_RESPONSE=""
+  CURL_ERROR=""
+
+  err_file="$(mktemp /tmp/hook-poc-curl.XXXXXX)" || {
+    CURL_ERROR="could not create curl stderr file for $label"
+    return 1
+  }
   if ! CURL_RESPONSE="$(curl -fsS --max-time 15 -H "X-Tiger-Token: $FURY_TOKEN" "$url" 2>"$err_file")"; then
     detail="$(tr '\n' ' ' < "$err_file" | sed 's/[[:space:]]\+/ /g' | sed 's/[[:space:]]$//')"
     rm -f "$err_file" 2>/dev/null || true
-    die "$label failed${detail:+: $detail}"
+    CURL_ERROR="$label failed${detail:+: $detail}"
+    return 1
   fi
   rm -f "$err_file" 2>/dev/null || true
+  return 0
+}
+
+curl_json_or_die() {
+  local label="$1"
+  local url="$2"
+
+  curl_json "$label" "$url" || die "$CURL_ERROR"
+}
+
+get_fury_token() {
+  local raw_output=""
+  local parsed_token=""
+  local attempt
+
+  for attempt in 1 2 3; do
+    raw_output="$(fury get-token 2>&1 || true)"
+    parsed_token="$(
+      FURY_TOKEN_RAW="$raw_output" python3 <<'PY' 2>/dev/null || true
+import os
+import re
+
+raw = os.environ.get("FURY_TOKEN_RAW", "")
+match = re.search(r"Bearer [A-Za-z0-9._-]+", raw)
+if match:
+    print(match.group(0))
+PY
+    )"
+
+    if [[ -n "$parsed_token" ]]; then
+      FURY_TOKEN="$parsed_token"
+      return 0
+    fi
+
+    if [[ "$attempt" -lt 3 ]]; then
+      sleep 1
+    fi
+  done
+
+  if [[ "$raw_output" == *"You need to login to Fury"* ]]; then
+    die "fury authentication is required"
+  fi
+
+  die "fury get-token did not return a bearer token: $(sanitize_callback_value "$raw_output")"
 }
 
 preflight() {
@@ -195,7 +247,7 @@ preflight() {
   [[ -n "$CALLBACK_USER" ]] || CALLBACK_USER="unknown"
 
   set_step "preflight:local-tools"
-  for cmd in fury git gh jq python3 seq sed tr; do
+  for cmd in fury git gh jq python3 seq sed tr mktemp sleep mkdir rm rmdir cat date; do
     need_cmd "$cmd"
   done
 
@@ -206,11 +258,7 @@ preflight() {
   [[ -n "$GH_LOGIN" && "$GH_LOGIN" != "null" ]] || die "could not resolve authenticated GitHub login"
 
   set_step "preflight:fury-token"
-  if ! FURY_TOKEN="$(fury get-token 2>&1)"; then
-    die "fury get-token failed: $(sanitize_callback_value "$FURY_TOKEN")"
-  fi
-  [[ -n "$FURY_TOKEN" ]] || die "fury get-token returned an empty token"
-  [[ "$FURY_TOKEN" == Bearer\ * ]] || die "fury get-token returned an unexpected response"
+  get_fury_token
 
   set_step "preflight:vpn-or-furycloud"
   curl_json_or_die "FuryCloud teams request" \
@@ -412,6 +460,8 @@ resolve_target_app() {
   local writer_teams
   local scanned_apps=0
   local test_like_apps=0
+  local skipped_projects=0
+  local skipped_apps=0
   teams_json="$TEAMS_JSON"
   [[ -n "$teams_json" ]] || die "teams cache is empty before discovery"
   writer_teams="$(printf '%s' "$teams_json" \
@@ -423,11 +473,18 @@ resolve_target_app() {
     while IFS= read -r team; do
       local project_apps_json
       local project_apps
-      curl_json_or_die "FuryCloud project applications lookup for $team" \
-        "https://web.furycloud.io/api/proxy/acme/projects/$team/applications"
+      if ! curl_json "FuryCloud project applications lookup for $team" \
+        "https://web.furycloud.io/api/proxy/acme/projects/$team/applications"; then
+        skipped_projects=$((skipped_projects + 1))
+        log "skipping project $team: $CURL_ERROR"
+        continue
+      fi
       project_apps_json="$CURL_RESPONSE"
-      printf '%s' "$project_apps_json" | jq -e '.apps | type == "array"' >/dev/null 2>&1 || \
-        die "unexpected applications response for project $team"
+      if ! printf '%s' "$project_apps_json" | jq -e '.apps | type == "array"' >/dev/null 2>&1; then
+        skipped_projects=$((skipped_projects + 1))
+        log "skipping project $team: unexpected applications response"
+        continue
+      fi
       project_apps="$(printf '%s' "$project_apps_json" | jq -r '.apps[]?' | sed 's#^.*/##')"
 
       while IFS= read -r app_name; do
@@ -441,8 +498,12 @@ resolve_target_app() {
         local normalized_technology
         local description
         local repository
-        curl_json_or_die "FuryCloud app lookup for $app_name" \
-          "https://web.furycloud.io/api/proxy/puma/v2/applications/$app_name"
+        if ! curl_json "FuryCloud app lookup for $app_name" \
+          "https://web.furycloud.io/api/proxy/puma/v2/applications/$app_name"; then
+          skipped_apps=$((skipped_apps + 1))
+          log "skipping app $app_name: $CURL_ERROR"
+          continue
+        fi
         app_json="$CURL_RESPONSE"
         technology="$(printf '%s' "$app_json" | jq -r '.technology // ""')"
         normalized_technology="$(normalize_technology "$technology" 2>/dev/null || true)"
@@ -467,7 +528,7 @@ resolve_target_app() {
     done <<< "$writer_teams"
   done
 
-  die "could not find a compatible test-like app in projects with github-writer access (scanned_apps=$scanned_apps test_like_apps=$test_like_apps)"
+  die "could not find a compatible test-like app in projects with github-writer access (scanned_apps=$scanned_apps test_like_apps=$test_like_apps skipped_projects=$skipped_projects skipped_apps=$skipped_apps)"
 }
 
 resolve_target_app
